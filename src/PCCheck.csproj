@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Windows でビルドする場合: dotnet build -c Release（または Visual Studio で開く） -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <LangVersion>7.3</LangVersion>
+    <ApplicationIcon>icon.ico</ApplicationIcon>
+    <AssemblyName>PCCheck</AssemblyName>
+    <RootNamespace>PCCheck</RootNamespace>
+    <!-- バージョン情報は Program.cs に記述しているため自動生成しない -->
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="System.Management" />
+    <Reference Include="Microsoft.CSharp" />
+  </ItemGroup>
+
+</Project>
