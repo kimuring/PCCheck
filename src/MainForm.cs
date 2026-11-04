@@ -16,7 +16,7 @@ namespace PCCheck
     /// </summary>
     public class MainForm : Form
     {
-        public const string Version = "1.0.1";
+        public const string Version = "1.0.2";
 
         private readonly float S;   // 画面の拡大率（125% なら 1.25） / 화면 배율 (125%면 1.25)
 

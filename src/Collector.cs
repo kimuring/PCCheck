@@ -7,6 +7,7 @@ using System.Linq;
 using System.Management;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using Microsoft.Win32;
 
 namespace PCCheck
@@ -445,59 +446,158 @@ namespace PCCheck
     /// <summary>
     /// プロセスごとの CPU・メモリ使用量。同じ名前（chrome など）はまとめる
     /// 프로세스별 CPU·메모리 사용량. 같은 이름(chrome 등)은 묶어서 계산
+    ///
+    /// 取得方法: NtQuerySystemInformation（タスクマネージャーと同じ方法）
+    ///   プロセスを 1 つずつ開かずに全プロセスの情報をまとめて受け取るため、
+    ///   管理者権限がなくても SYSTEM で動くサービスやセキュリティソフトの CPU 使用量も集計できる。
+    ///   ※ 以前の Process.TotalProcessorTime 方式では、権限のないプロセスが 0% になっていた
+    /// 수집 방법: NtQuerySystemInformation (작업 관리자와 같은 방식)
+    ///   프로세스를 하나씩 열지 않고 전체 정보를 한 번에 받기 때문에,
+    ///   관리자 권한이 없어도 SYSTEM으로 도는 서비스·백신의 CPU 사용량까지 집계 가능.
+    ///   ※ 이전 Process.TotalProcessorTime 방식은 권한 없는 프로세스가 0%로 나왔음
     /// </summary>
     internal class ProcSampler
     {
-        private Dictionary<int, TimeSpan> _last = new Dictionary<int, TimeSpan>();
-        private DateTime _lastTime = DateTime.MinValue;
+        /// <summary>1 プロセス分の生データ / 프로세스 1개 분의 원시 데이터</summary>
+        private class RawProc
+        {
+            public int Pid;
+            public long CreateTime;   // PID の使い回し対策 / PID 재사용 대책
+            public string Name;
+            public long CpuTicks;     // CPU 時間の累計（100 ナノ秒単位） / CPU 시간 누적 (100나노초 단위)
+            public long Memory;       // プライベートワーキングセット（タスクマネージャーの「メモリ」と同じ）
+        }
+
+        private Dictionary<Tuple<int, long>, long> _last = new Dictionary<Tuple<int, long>, long>();
+        private long _lastTime;   // DateTime.UtcNow.Ticks
 
         public List<ProcInfo> Sample()
         {
-            var now = DateTime.UtcNow;
-            bool first = _lastTime == DateTime.MinValue;
-            double elapsed = (now - _lastTime).TotalMilliseconds;
+            List<RawProc> raw = null;
+            if (IntPtr.Size == 8)   // 構造体のずれを避けるため 64 ビット時のみ / 구조체 위치 문제를 피하려고 64비트에서만
+            {
+                try { raw = QueryNative(); } catch { raw = null; }
+            }
+            if (raw == null) raw = QueryManaged();   // 取れなければ従来の方法 / 안 되면 기존 방식
+
+            long now = DateTime.UtcNow.Ticks;
+            bool first = _lastTime == 0;
+            double elapsed = now - _lastTime;   // 100 ナノ秒単位 / 100나노초 단위
             int cores = Environment.ProcessorCount;
 
-            var next = new Dictionary<int, TimeSpan>();
+            var next = new Dictionary<Tuple<int, long>, long>();
             var groups = new Dictionary<string, ProcInfo>(StringComparer.OrdinalIgnoreCase);
 
+            foreach (var r in raw)
+            {
+                // CPU% = (この間に使った CPU 時間) ÷ (経過時間 × コア数)
+                // CPU% = (그 사이에 사용한 CPU 시간) ÷ (경과 시간 × 코어 수)
+                double cpu = 0;
+                var key = Tuple.Create(r.Pid, r.CreateTime);
+                if (r.CpuTicks >= 0)
+                {
+                    next[key] = r.CpuTicks;
+                    long prev;
+                    if (!first && elapsed > 0 && _last.TryGetValue(key, out prev) && r.CpuTicks >= prev)
+                        cpu = (r.CpuTicks - prev) / (elapsed * cores) * 100;
+                }
+
+                ProcInfo g;
+                if (!groups.TryGetValue(r.Name, out g)) { g = new ProcInfo { Name = r.Name }; groups[r.Name] = g; }
+                g.Count++;
+                g.Cpu += cpu;
+                g.Memory += r.Memory;
+            }
+
+            _last = next;
+            _lastTime = now;
+            return groups.Values.ToList();
+        }
+
+        // ----- 方法 1: NtQuerySystemInformation（全プロセス・権限不要） -----
+        // ----- 방법 1: NtQuerySystemInformation (전체 프로세스·권한 불필요) -----
+        private const int SystemProcessInformation = 5;
+        private const int STATUS_INFO_LENGTH_MISMATCH = unchecked((int)0xC0000004);
+
+        // SYSTEM_PROCESS_INFORMATION 構造体の中の位置（64 ビット版）
+        // SYSTEM_PROCESS_INFORMATION 구조체 안의 위치 (64비트판)
+        private const int OffNext = 0x00, OffPrivateWs = 0x08, OffCreate = 0x20, OffUser = 0x28,
+                          OffKernel = 0x30, OffNameLen = 0x38, OffNameBuf = 0x40, OffPid = 0x50;
+
+        private static List<RawProc> QueryNative()
+        {
+            int size = 1 << 20;   // 1MB から始めて、足りなければ広げる / 1MB부터 시작해서 부족하면 늘림
+            for (int attempt = 0; attempt < 6; attempt++)
+            {
+                IntPtr buf = Marshal.AllocHGlobal(size);
+                try
+                {
+                    int needed;
+                    int status = Native.NtQuerySystemInformation(SystemProcessInformation, buf, size, out needed);
+                    if (status == STATUS_INFO_LENGTH_MISMATCH)
+                    {
+                        size = Math.Max(size * 2, needed + 64 * 1024);
+                        continue;
+                    }
+                    if (status != 0) return null;
+
+                    var list = new List<RawProc>();
+                    long offset = 0;
+                    while (offset + OffPid + 8 <= size)
+                    {
+                        var p = new IntPtr(buf.ToInt64() + offset);
+                        int nextOff = Marshal.ReadInt32(p, OffNext);
+                        long pid = Marshal.ReadIntPtr(p, OffPid).ToInt64();
+                        int nameLen = (ushort)Marshal.ReadInt16(p, OffNameLen);   // バイト数 / 바이트 수
+                        IntPtr nameBuf = Marshal.ReadIntPtr(p, OffNameBuf);
+
+                        if (pid != 0 && nameBuf != IntPtr.Zero && nameLen > 0 && nameLen < 1024)   // pid 0 = Idle
+                        {
+                            string name = Marshal.PtrToStringUni(nameBuf, nameLen / 2);
+                            if (name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+                                name = name.Substring(0, name.Length - 4);
+                            list.Add(new RawProc
+                            {
+                                Pid = (int)pid,
+                                CreateTime = Marshal.ReadInt64(p, OffCreate),
+                                Name = name,
+                                CpuTicks = Marshal.ReadInt64(p, OffUser) + Marshal.ReadInt64(p, OffKernel),
+                                Memory = Marshal.ReadInt64(p, OffPrivateWs),
+                            });
+                        }
+
+                        if (nextOff <= 0) break;
+                        offset += nextOff;
+                    }
+                    return list.Count > 0 ? list : null;
+                }
+                finally { Marshal.FreeHGlobal(buf); }
+            }
+            return null;
+        }
+
+        // ----- 方法 2: Process クラス（権限のないプロセスは CPU が取れない） -----
+        // ----- 방법 2: Process 클래스 (권한 없는 프로세스는 CPU를 못 가져옴) -----
+        private static List<RawProc> QueryManaged()
+        {
+            var list = new List<RawProc>();
             foreach (var p in Process.GetProcesses())
             {
                 using (p)
                 {
                     try
                     {
-                        if (p.Id == 0) continue;   // System Idle Process
-                        string name = p.ProcessName;
-                        long mem = 0;
-                        try { mem = p.WorkingSet64; } catch { }
-
-                        // CPU% = (この間に使った CPU 時間) ÷ (経過時間 × コア数)
-                        // CPU% = (그 사이에 사용한 CPU 시간) ÷ (경과 시간 × 코어 수)
-                        double cpu = 0;
-                        try
-                        {
-                            var t = p.TotalProcessorTime;   // 権限がないプロセスは例外になる / 권한 없는 프로세스는 예외 발생
-                            next[p.Id] = t;
-                            TimeSpan prev;
-                            if (!first && elapsed > 0 && _last.TryGetValue(p.Id, out prev) && t >= prev)
-                                cpu = (t - prev).TotalMilliseconds / (elapsed * cores) * 100;
-                        }
-                        catch { }
-
-                        ProcInfo g;
-                        if (!groups.TryGetValue(name, out g)) { g = new ProcInfo { Name = name }; groups[name] = g; }
-                        g.Count++;
-                        g.Cpu += cpu;
-                        g.Memory += mem;
+                        if (p.Id == 0) continue;
+                        var r = new RawProc { Pid = p.Id, Name = p.ProcessName, CpuTicks = -1 };
+                        try { r.Memory = p.WorkingSet64; } catch { }
+                        try { r.CpuTicks = p.TotalProcessorTime.Ticks; } catch { }
+                        try { r.CreateTime = p.StartTime.Ticks; } catch { }
+                        list.Add(r);
                     }
                     catch { }
                 }
             }
-
-            _last = next;
-            _lastTime = now;
-            return groups.Values.ToList();
+            return list;
         }
     }
 }

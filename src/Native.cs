@@ -40,6 +40,11 @@ namespace PCCheck
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool GlobalMemoryStatusEx([In, Out] MEMORYSTATUSEX buffer);
 
+        // 全プロセスの情報（CPU 時間・メモリ）をまとめて取得。タスクマネージャーと同じ仕組み
+        // 전체 프로세스 정보(CPU 시간·메모리)를 한 번에 가져옴. 작업 관리자와 같은 방식
+        [DllImport("ntdll.dll")]
+        public static extern int NtQuerySystemInformation(int infoClass, IntPtr buffer, int length, out int returnLength);
+
         // 起動してからの経過ミリ秒 / 부팅 후 경과 밀리초
         [DllImport("kernel32.dll")]
         public static extern ulong GetTickCount64();
